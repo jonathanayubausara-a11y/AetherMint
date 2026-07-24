@@ -51,6 +51,7 @@ import { detectSuspiciousPatterns } from './middleware/sanitizer';
 // @ts-ignore
 import { tieredRateLimiter, transactionLimiter } from './middleware/rateLimiter';
 import { idempotency } from './middleware/idempotency';
+import { metricsMiddleware, websocketConnectionsActive } from './middleware/metrics';
 
 // Connect to Redis
 connectRedis();
@@ -131,6 +132,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(requestId);
 app.use(requestLogger);
+app.use(metricsMiddleware);
 
 // Reject new traffic with 503 once a graceful shutdown has begun, while still
 // serving the health probe and root so orchestrators can read the drain state.
@@ -252,6 +254,11 @@ app.use('/api/audit', auditRoutes);
 // CSP Violation Reporting endpoint
 app.use('/api/csp-violation', cspViolationRoutes);
 
+// Prometheus metrics endpoint
+// @ts-ignore
+const metricsRoutes = resolveRoute(require('./routes/metrics'));
+app.use('/api/metrics', metricsRoutes);
+
 // Root endpoint
 app.get('/', (req, res) => {
   const baseUrl = `${req.protocol}://${req.get('host')}`;
@@ -297,6 +304,9 @@ app.use(errorHandler);
 
 const PORT = process.env.PORT || 3001;
 
+// WebSocket metrics interval reference for cleanup on shutdown
+let wsMetricsInterval: ReturnType<typeof setInterval> | undefined;
+
 async function startServer() {
   try {
     // Run migrations automatically if DATABASE_URL is configured
@@ -329,7 +339,18 @@ async function startServer() {
       }
     }
 
-server.listen(PORT, () => {
+    // Periodically update WebSocket active connection count for Prometheus metrics
+    wsMetricsInterval = setInterval(() => {
+      try {
+        const io = websocketService.getIO();
+        const count = io?.engine?.clientsCount ?? 0;
+        websocketConnectionsActive.set(count);
+      } catch {
+        // Silently ignore if WebSocket not available
+      }
+    }, 15_000);
+
+    server.listen(PORT, () => {
        logger.info('AetherMint Education Backend started', {
          port: PORT,
          routes: [
@@ -346,6 +367,7 @@ server.listen(PORT, () => {
            '/api/secure-comm',
            '/api/audit',
            '/api/health',
+           '/api/metrics',
          ],
        });
      });
@@ -363,6 +385,7 @@ if (require.main === module) {
   registerShutdownHandlers({
     logger,
     steps: [
+      { name: 'ws-metrics-interval', run: () => { if (wsMetricsInterval) clearInterval(wsMetricsInterval); } },
       { name: 'websocket', run: () => websocketService.close() },
       { name: 'http-server', run: () => closeHttpServer(server) },
       { name: 'transaction-queue', run: () => (transactionQueue as any).stopProcessing() },
